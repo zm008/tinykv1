@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -135,6 +136,8 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
+
+	randomElectionTimeout int
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
 	heartbeatElapsed int
@@ -165,7 +168,25 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+
+	r := &Raft{
+
+		id:  c.ID,
+		Prs: make(map[uint64]*Progress),
+
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
+
+	for _, i := range c.peers {
+
+		r.Prs[i] = &Progress{Match: 0, Next: 1}
+
+	}
+
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -183,32 +204,472 @@ func (r *Raft) sendHeartbeat(to uint64) {
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+
+	switch r.State {
+	case StateFollower:
+		// if election timeout ,become Candidate
+		r.electionElapsed++
+		if r.electionElapsed >= r.randomElectionTimeout {
+			r.electionElapsed = 0
+			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+		}
+
+	case StateCandidate:
+
+		// if election timeout re-election
+		r.electionElapsed++
+		if r.electionElapsed >= r.randomElectionTimeout {
+			r.electionElapsed = 0
+			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+		}
+
+	case StateLeader:
+
+		r.heartbeatElapsed++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+		}
+
+	}
+
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.Term = term
+	r.Lead = lead
+	r.Vote = None
+	r.State = StateFollower
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.State = StateCandidate
+	r.Lead = None
+	r.Term++
+	r.Vote = r.id
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+
+	r.State = StateLeader
+	r.Lead = r.id
+	// lastIndex := r.RaftLog.LastIndex()
+	r.heartbeatElapsed = 0
+
+	for peer := range r.Prs {
+
+		if peer == r.id {
+			continue
+		}
+		message := pb.Message{
+			MsgType: pb.MessageType_MsgHeartbeat,
+			To:      peer,
+			Term:    r.Term}
+		r.send(message)
+
+	}
+
+	// for peer := range r.Prs {
+	// 	if peer == r.id {
+	// 		r.Prs[peer].Next = lastIndex + 2
+	// 		r.Prs[peer].Match = lastIndex + 1
+	// 	} else {
+	// 		r.Prs[peer].Next = lastIndex + 1
+	// 	}
+	// }
+	// r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{Term: r.Term, Index: r.RaftLog.LastIndex() + 1})
+	// r.bcastAppend()
+	// if len(r.Prs) == 1 {
+	// 	r.RaftLog.committed = r.Prs[r.id].Match
+	// }
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+
+		switch m.MsgType {
+
+		case pb.MessageType_MsgHup:
+
+			// send selction vote to other nodes
+
+			r.becomeCandidate()
+
+			r.electionElapsed = 0
+			r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			if len(r.Prs) == 1 {
+				r.becomeLeader()
+			}
+			for peer := range r.Prs {
+				if peer == r.id {
+					continue
+				}
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVote,
+					To:      peer,
+					Term:    r.Term}
+				r.send(message)
+			}
+
+		case pb.MessageType_MsgRequestVote:
+
+			//如果当前没有给任何节点投票过 或者 消息的任期号大于当前任期号：
+
+			// 如果term不满足，投票为拒绝
+			if m.Term < r.Term {
+
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+
+			}
+			if m.Term > r.Term {
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+
+				r.Vote = m.From
+				r.Term = m.Term
+				r.electionElapsed = 0
+				r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  false,
+					Term:    r.Term}
+				r.send(message)
+
+				return nil
+			}
+			//如果给别人投票，投票为拒绝
+			if r.Vote != None && r.Vote != m.From {
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+			}
+
+			//除上述条件，则投票
+
+			r.Vote = m.From
+			r.Term = m.Term
+			r.electionElapsed = 0
+			r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				Reject:  false,
+				Term:    r.Term}
+			r.send(message)
+
+		case pb.MessageType_MsgRequestVoteResponse:
+
+		case pb.MessageType_MsgHeartbeat:
+
+			if m.Term >= r.Term {
+
+				r.becomeFollower(m.Term, r.id)
+
+			}
+
+			r.Term = m.Term
+
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgHeartbeatResponse,
+
+				To:   m.From,
+				Term: r.Term,
+			}
+
+			r.send(message)
+
+		case pb.MessageType_MsgAppend:
+
+			if r.Term < m.Term {
+				r.Term = m.Term
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+			}
+
+		}
+
 	case StateCandidate:
+
+		switch m.MsgType {
+
+		case pb.MessageType_MsgHup:
+
+			r.becomeCandidate()
+
+			r.electionElapsed = 0
+			r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+
+			if len(r.Prs) == 1 {
+				r.becomeLeader()
+			}
+			for peer := range r.Prs {
+				if peer == r.id {
+					continue
+				}
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVote,
+					To:      peer,
+					Term:    r.Term}
+				r.send(message)
+			}
+
+		case pb.MessageType_MsgRequestVote:
+
+			//如果当前没有给任何节点投票过 或者 消息的任期号大于当前任期号：
+
+			// 如果term不满足，投票为拒绝
+			if m.Term < r.Term {
+
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+
+			}
+			if m.Term > r.Term {
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+
+				r.Vote = m.From
+				r.Term = m.Term
+				r.electionElapsed = 0
+				r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  false,
+					Term:    r.Term}
+				r.send(message)
+
+				return nil
+			}
+			//如果给别人投票，投票为拒绝
+			if r.Vote != None && r.Vote != m.From {
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+			}
+
+			//除上述条件，则投票
+
+			r.Vote = m.From
+			r.Term = m.Term
+			r.electionElapsed = 0
+			r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				Reject:  false,
+				Term:    r.Term}
+			r.send(message)
+
+		case pb.MessageType_MsgRequestVoteResponse:
+
+			r.votes[m.From] = !m.Reject
+			nodesHalf := len(r.Prs) / 2
+
+			var g int
+
+			for _, ok := range r.votes {
+
+				if ok {
+					g++
+				}
+			}
+
+			if g > nodesHalf {
+
+				r.becomeLeader()
+
+			} else if re := len(r.Prs) - len(r.votes); re < nodesHalf {
+
+				r.becomeFollower(m.Term, None)
+			}
+
+		case pb.MessageType_MsgHeartbeat:
+
+			if m.Term >= r.Term {
+
+				r.becomeFollower(m.Term, r.id)
+
+				return nil
+			}
+
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgHeartbeatResponse,
+
+				To:     m.From,
+				Reject: false,
+				Term:   r.Term,
+			}
+
+			r.send(message)
+		case pb.MessageType_MsgAppend:
+
+			if r.Term <= m.Term {
+				r.Term = m.Term
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+			}
+
+		}
+
 	case StateLeader:
+
+		switch m.MsgType {
+
+		case pb.MessageType_MsgHup:
+
+		case pb.MessageType_MsgBeat:
+
+			for peer := range r.Prs {
+
+				if peer == r.id {
+					continue
+				}
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgHeartbeat,
+					To:      peer,
+					Term:    r.Term}
+
+				r.send(message)
+			}
+
+		case pb.MessageType_MsgHeartbeat:
+
+			if m.Term >= r.Term {
+
+				r.becomeFollower(m.Term, r.id)
+
+				return nil
+			}
+
+			r.Term = m.Term
+
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgHeartbeatResponse,
+
+				To:     m.From,
+				Reject: false,
+				Term:   r.Term,
+			}
+
+			r.send(message)
+
+		case pb.MessageType_MsgHeartbeatResponse:
+
+			r.sendAppend(m.From)
+
+		case pb.MessageType_MsgRequestVote:
+			//如果当前没有给任何节点投票过 或者 消息的任期号大于当前任期号：
+
+			// 如果term不满足，投票为拒绝
+			if m.Term < r.Term {
+
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+
+			}
+			if m.Term > r.Term {
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+
+				r.Vote = m.From
+				r.Term = m.Term
+				r.electionElapsed = 0
+				r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  false,
+					Term:    r.Term}
+				r.send(message)
+
+				return nil
+			}
+			//如果给别人投票，投票为拒绝
+			if r.Vote != None && r.Vote != m.From {
+				message := pb.Message{
+					MsgType: pb.MessageType_MsgRequestVoteResponse,
+					To:      m.From,
+					Reject:  true,
+					Term:    r.Term}
+				r.send(message)
+				return nil
+			}
+
+			//除上述条件，则投票
+
+			r.Vote = m.From
+			r.Term = m.Term
+			r.electionElapsed = 0
+			r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			message := pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				Reject:  false,
+				Term:    r.Term}
+			r.send(message)
+
+		case pb.MessageType_MsgAppend:
+
+			if r.Term < m.Term {
+				r.Term = m.Term
+
+				if r.State != StateFollower {
+					r.becomeFollower(m.Term, m.From)
+				}
+			}
+
+		}
+
 	}
 	return nil
 }
@@ -236,4 +697,20 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) send(m pb.Message) {
+	m.From = r.id
+
+	// 注意这里只是添加到msgs中
+	r.msgs = append(r.msgs, m)
+}
+
+func (r *Raft) bcastAppend() {
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendAppend(peer)
+	}
 }

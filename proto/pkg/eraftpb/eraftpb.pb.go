@@ -68,7 +68,7 @@ const (
 	MessageType_MsgRequestVoteResponse MessageType = 6
 	// 'MessageType_MsgSnapshot' requests to install a snapshot message.
 	MessageType_MsgSnapshot MessageType = 7
-	// 'MessageType_MsgHeartbeat' sends heartbeat from leader to its followers.
+	// 'MessageType_MsgHeartbeat' sends heartbeat from leader to its followers. 领导者周期性地向所有跟随者发送心跳消息
 	MessageType_MsgHeartbeat MessageType = 8
 	// 'MessageType_MsgHeartbeatResponse' is a response to 'MessageType_MsgHeartbeat'.
 	MessageType_MsgHeartbeatResponse MessageType = 9
